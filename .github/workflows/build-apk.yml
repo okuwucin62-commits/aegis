@@ -1,0 +1,139 @@
+name: Build AEGIS APK
+
+# Builds a release APK entirely in the cloud — no PC needed.
+# Supports a ZIP upload: put `aegis-project.zip` in the repo root and this
+# workflow extracts it, finds the Flutter project, and builds the APK.
+#
+# Runs automatically on every push, and can be triggered by hand from the
+# GitHub "Actions" tab (green "Run workflow" button) on your tablet.
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch: {}
+
+# Needed so the workflow can publish the APK to a GitHub Release.
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.29.0
+          cache: true
+
+      - name: Show Flutter version
+        run: flutter --version
+
+      # ---- ZIP SUPPORT ----------------------------------------------------
+      # If the project was uploaded as a ZIP (because the Android file picker
+      # can't select folders), extract it. Then locate the directory that
+      # contains pubspec.yaml — whether the ZIP had files at its root or nested
+      # inside a folder like `aegis-project/`. That directory becomes PROJECT_DIR.
+      - name: Extract ZIP if present & locate project
+        id: locate
+        run: |
+          set -e
+          if [ -f "aegis-project.zip" ]; then
+            echo "Found aegis-project.zip — extracting…"
+            mkdir -p _unzipped
+            unzip -o -q aegis-project.zip -d _unzipped
+          fi
+
+          # Find pubspec.yaml anywhere in the repo (prefer shallowest path).
+          PUBSPEC=$(find . -name pubspec.yaml -not -path "*/build/*" \
+            -not -path "*/.dart_tool/*" -printf '%d %p\n' 2>/dev/null \
+            | sort -n | head -n1 | cut -d' ' -f2-)
+
+          if [ -z "$PUBSPEC" ]; then
+            echo "::error::No pubspec.yaml found. Make sure aegis-project.zip contains the Flutter project."
+            exit 1
+          fi
+
+          PROJECT_DIR=$(dirname "$PUBSPEC")
+          echo "Project directory: $PROJECT_DIR"
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+
+      # Back up our custom Android files (permissions manifest, gradle with
+      # desugaring, MainActivity, icons) so `flutter create` can't clobber them.
+      - name: Back up custom android config
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        run: |
+          mkdir -p /tmp/aegis-android-backup
+          if [ -d android ]; then cp -r android /tmp/aegis-android-backup/; fi
+
+      # Fill in only the machine-specific pieces Flutter needs (gradle wrapper
+      # jar, .gradle scaffolding, local.properties). This ADDS missing files.
+      - name: Ensure platform scaffolding
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        run: flutter create --platforms=android --org ai.aegis .
+
+      # Restore our custom manifest / gradle / kotlin / icons over whatever
+      # flutter create produced. Remove stray generated sources first so there
+      # is exactly ONE MainActivity (ours, at ai/aegis/app).
+      - name: Restore custom android config
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        run: |
+          if [ -d /tmp/aegis-android-backup/android ]; then
+            rm -rf android/app/src/main/kotlin android/app/src/main/java
+            cp -r /tmp/aegis-android-backup/android/* android/ 2>/dev/null || true
+            echo "Restored custom Android config. MainActivity(s):"
+            find android/app/src/main -name "MainActivity.kt" -o -name "MainActivity.java" || true
+          fi
+
+      - name: Get dependencies
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        run: flutter pub get
+
+      - name: Analyze (non-blocking)
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        run: flutter analyze || true
+
+      - name: Build release APK
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        run: flutter build apk --release
+
+      # Copy the APK to a fixed top-level path so upload steps are simple.
+      - name: Collect APK
+        run: |
+          set -e
+          APK=$(find "${{ steps.locate.outputs.project_dir }}/build/app/outputs/flutter-apk" -name "app-release.apk" | head -n1)
+          if [ -z "$APK" ]; then
+            echo "::error::APK not found after build."
+            exit 1
+          fi
+          cp "$APK" ./AEGIS.apk
+          echo "APK ready: $(du -h ./AEGIS.apk | cut -f1)"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aegis-release-apk
+          path: AEGIS.apk
+          if-no-files-found: error
+
+      # Publish the APK to a GitHub Release for a permanent tap-to-download link.
+      - name: Publish to Releases
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: AEGIS build ${{ github.run_number }}
+          files: AEGIS.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
